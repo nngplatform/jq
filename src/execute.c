@@ -10,13 +10,10 @@
 #include "bytecode.h"
 
 #include "jv_alloc.h"
-#include "jq_parser.h"
 #include "locfile.h"
 #include "jv.h"
 #include "jq.h"
-#include "parser.h"
 #include "builtin.h"
-#include "util.h"
 #include "linker.h"
 
 struct jq_state {
@@ -49,6 +46,8 @@ struct jq_state {
   void *input_cb_data;
   jq_msg_cb debug_cb;
   void *debug_cb_data;
+  jq_msg_cb stderr_cb;
+  void *stderr_cb_data;
 };
 
 struct closure {
@@ -313,7 +312,9 @@ static void jq_reset(jq_state *jq) {
 
   jq->halted = 0;
   jv_free(jq->exit_code);
+  jq->exit_code = jv_invalid();
   jv_free(jq->error_message);
+  jq->error_message = jv_invalid();
   if (jv_get_kind(jq->path) != JV_KIND_INVALID)
     jv_free(jq->path);
   jq->path = jv_null();
@@ -337,8 +338,6 @@ static void set_error(jq_state *jq, jv value) {
 #define ON_BACKTRACK(op) ((op)+NUM_OPCODES)
 
 jv jq_next(jq_state *jq) {
-  jv cfunc_input[MAX_CFUNCTION_ARGS];
-
   jv_nomem_handler(jq->nomem_handler, jq->nomem_handler_data);
 
   uint16_t* pc = stack_restore(jq);
@@ -346,6 +345,7 @@ jv jq_next(jq_state *jq) {
 
   int raising;
   int backtracking = !jq->initial_execution;
+
   jq->initial_execution = 0;
   assert(jv_get_kind(jq->error) == JV_KIND_NULL);
   while (1) {
@@ -402,6 +402,12 @@ jv jq_next(jq_state *jq) {
 
     case TOP: break;
 
+    case ERRORK: {
+      jv v = jv_array_get(jv_copy(frame_current(jq)->bc->constants), *pc++);
+      set_error(jq, jv_invalid_with_msg(v));
+      goto do_backtrack;
+    }
+
     case LOADK: {
       jv v = jv_array_get(jv_copy(frame_current(jq)->bc->constants), *pc++);
       assert(jv_is_valid(v));
@@ -417,13 +423,6 @@ jv jq_next(jq_state *jq) {
 
     case DUP: {
       jv v = stack_pop(jq);
-      stack_push(jq, jv_copy(v));
-      stack_push(jq, v);
-      break;
-    }
-
-    case DUPN: {
-      jv v = stack_popn(jq);
       stack_push(jq, jv_copy(v));
       stack_push(jq, v);
       break;
@@ -490,10 +489,11 @@ jv jq_next(jq_state *jq) {
         stack_push(jq, jv_object_set(objv, k, v));
         stack_push(jq, stktop);
       } else {
-        char errbuf[15];
-        set_error(jq, jv_invalid_with_msg(jv_string_fmt("Cannot use %s (%s) as object key",
-                                                        jv_kind_name(jv_get_kind(k)),
-                                                        jv_dump_string_trunc(jv_copy(k), errbuf, sizeof(errbuf)))));
+        char errbuf[30];
+        set_error(jq, jv_invalid_with_msg(jv_string_fmt(
+                "Cannot use %s (%s) as object key",
+                jv_kind_name(jv_get_kind(k)),
+                jv_dump_string_trunc(jv_copy(k), errbuf, sizeof(errbuf)))));
         jv_free(stktop);
         jv_free(v);
         jv_free(k);
@@ -509,24 +509,29 @@ jv jq_next(jq_state *jq) {
       uint16_t v = *pc++;
       jv* var = frame_local_var(jq, v, level);
       jv max = stack_pop(jq);
+      jv step = stack_pop(jq);
       if (raising) {
         jv_free(max);
+        jv_free(step);
         goto do_backtrack;
-      } 
-      if (jv_get_kind(*var) != JV_KIND_NUMBER ||
-          jv_get_kind(max) != JV_KIND_NUMBER) {
-        set_error(jq, jv_invalid_with_msg(jv_string_fmt("Range bounds must be numeric")));
+      }
+
+      if (jv_get_kind(*var) != JV_KIND_NUMBER || jv_get_kind(max) != JV_KIND_NUMBER ||
+          jv_get_kind(step) != JV_KIND_NUMBER) {
+        set_error(jq, jv_invalid_with_msg(jv_string("Range bounds and step must be numeric")));
         jv_free(max);
+        jv_free(step);
         goto do_backtrack;
-      } else if (jv_number_value(*var) >= jv_number_value(max)) {
-        /* finished iterating */
+      } else if (jv_cmp(jv_copy(*var), jv_copy(max)) * jv_cmp(jv_copy(step), jv_number(0)) >= 0) {
         jv_free(max);
+        jv_free(step);
         goto do_backtrack;
       } else {
         jv curr = *var;
-        *var = jv_number(jv_number_value(*var) + 1);
+        *var = jv_number(jv_number_value(curr) + jv_number_value(step));
 
         struct stack_pos spos = stack_get_pos(jq);
+        stack_push(jq, step);
         stack_push(jq, max);
         stack_save(jq, pc - 3, spos);
 
@@ -572,6 +577,7 @@ jv jq_next(jq_state *jq) {
 
     case STOREVN:
         stack_save(jq, pc - 1, stack_get_pos(jq));
+        JQ_FALLTHROUGH;
     case STOREV: {
       uint16_t level = *pc++;
       uint16_t v = *pc++;
@@ -675,7 +681,7 @@ jv jq_next(jq_state *jq) {
       jv k = stack_pop(jq);
       // detect invalid path expression like path(reverse | .a)
       if (!path_intact(jq, jv_copy(t))) {
-        char keybuf[15];
+        char keybuf[30];
         char objbuf[30];
         jv msg = jv_string_fmt(
             "Invalid path expression near attempt to access element %s of %s",
@@ -731,7 +737,7 @@ jv jq_next(jq_state *jq) {
       }
       stack_push(jq, container);
       stack_push(jq, jv_number(-1));
-      // fallthrough
+      JQ_FALLTHROUGH;
     }
     case ON_BACKTRACK(EACH):
     case ON_BACKTRACK(EACH_OPT): {
@@ -761,18 +767,20 @@ jv jq_next(jq_state *jq) {
       } else {
         assert(opcode == EACH || opcode == EACH_OPT);
         if (opcode == EACH) {
-          char errbuf[15];
-          set_error(jq,
-                    jv_invalid_with_msg(jv_string_fmt("Cannot iterate over %s (%s)",
-                                                      jv_kind_name(jv_get_kind(container)),
-                                                      jv_dump_string_trunc(jv_copy(container), errbuf, sizeof(errbuf)))));
+          char errbuf[30];
+          set_error(jq, jv_invalid_with_msg(jv_string_fmt(
+                  "Cannot iterate over %s (%s)",
+                  jv_kind_name(jv_get_kind(container)),
+                  jv_dump_string_trunc(jv_copy(container), errbuf, sizeof(errbuf)))));
         }
         keep_going = 0;
       }
 
       if (!keep_going || raising) {
-        if (keep_going)
+        if (keep_going) {
+          jv_free(key);
           jv_free(value);
+        }
         jv_free(container);
         goto do_backtrack;
       } else if (is_last) {
@@ -806,7 +814,59 @@ jv jq_next(jq_state *jq) {
       break;
     }
 
-    case FORK_OPT:
+    case TRY_BEGIN:
+      stack_save(jq, pc - 1, stack_get_pos(jq));
+      pc++; // skip handler offset this time
+      break;
+
+    case TRY_END:
+      stack_save(jq, pc - 1, stack_get_pos(jq));
+      break;
+
+    case ON_BACKTRACK(TRY_BEGIN): {
+      if (!raising) {
+        /*
+         * `try EXP ...` -- EXP backtracked (e.g., EXP was `empty`), so we
+         * backtrack more:
+         */
+        jv_free(stack_pop(jq));
+        goto do_backtrack;
+      }
+
+      /*
+       * Else `(try EXP ... ) | EXP2` raised an error.
+       *
+       * If the error was wrapped in another error, then that means EXP2 raised
+       * the error.  We unwrap it and re-raise it as it wasn't raised by EXP.
+       *
+       * See commentary in gen_try().
+       */
+      jv e = jv_invalid_get_msg(jv_copy(jq->error));
+      if (!jv_is_valid(e) && jv_invalid_has_msg(jv_copy(e))) {
+        set_error(jq, e);
+        goto do_backtrack;
+      }
+      jv_free(e);
+
+      /*
+       * Else we caught an error containing a non-error value, so we jump to
+       * the handler.
+       *
+       * See commentary in gen_try().
+       */
+      uint16_t offset = *pc++;
+      jv_free(stack_pop(jq)); // free the input
+      stack_push(jq, jv_invalid_get_msg(jq->error));  // push the error's message
+      jq->error = jv_null();
+      pc += offset;
+      break;
+    }
+    case ON_BACKTRACK(TRY_END):
+      // Wrap the error so the matching TRY_BEGIN doesn't catch it
+      if (raising)
+        set_error(jq, jv_invalid_with_msg(jv_copy(jq->error)));
+      goto do_backtrack;
+
     case DESTRUCTURE_ALT:
     case FORK: {
       stack_save(jq, pc - 1, stack_get_pos(jq));
@@ -814,7 +874,6 @@ jv jq_next(jq_state *jq) {
       break;
     }
 
-    case ON_BACKTRACK(FORK_OPT):
     case ON_BACKTRACK(DESTRUCTURE_ALT): {
       if (jv_is_valid(jq->error)) {
         // `try EXP ...` backtracked here (no value, `empty`), so we backtrack more
@@ -844,39 +903,29 @@ jv jq_next(jq_state *jq) {
 
     case CALL_BUILTIN: {
       int nargs = *pc++;
-      jv top = stack_pop(jq);
-      jv* in = cfunc_input;
-      in[0] = top;
-      for (int i = 1; i < nargs; i++) {
-        in[i] = stack_pop(jq);
-      }
       struct cfunction* function = &frame_current(jq)->bc->globals->cfunctions[*pc++];
-      typedef jv (*func_1)(jq_state*,jv);
-      typedef jv (*func_2)(jq_state*,jv,jv);
-      typedef jv (*func_3)(jq_state*,jv,jv,jv);
-      typedef jv (*func_4)(jq_state*,jv,jv,jv,jv);
-      typedef jv (*func_5)(jq_state*,jv,jv,jv,jv,jv);
+      jv in[MAX_CFUNCTION_ARGS];
+      for (int i = 0; i < nargs; ++i)
+        in[i] = stack_pop(jq);
+
+      jv top;
       switch (function->nargs) {
-      case 1: top = ((func_1)function->fptr)(jq, in[0]); break;
-      case 2: top = ((func_2)function->fptr)(jq, in[0], in[1]); break;
-      case 3: top = ((func_3)function->fptr)(jq, in[0], in[1], in[2]); break;
-      case 4: top = ((func_4)function->fptr)(jq, in[0], in[1], in[2], in[3]); break;
-      case 5: top = ((func_5)function->fptr)(jq, in[0], in[1], in[2], in[3], in[4]); break;
-      // FIXME: a) up to 7 arguments (input + 6), b) should assert
-      // because the compiler should not generate this error.
-      default: return jv_invalid_with_msg(jv_string("Function takes too many arguments"));
+      case 1: top = function->fptr.a1(jq, in[0]); break;
+      case 2: top = function->fptr.a2(jq, in[0], in[1]); break;
+      case 3: top = function->fptr.a3(jq, in[0], in[1], in[2]); break;
+      case 4: top = function->fptr.a4(jq, in[0], in[1], in[2], in[3]); break;
+      default: assert(0 && "Invalid number of arguments");
       }
 
-      if (jv_is_valid(top)) {
-        stack_push(jq, top);
-      } else if (jv_invalid_has_msg(jv_copy(top))) {
-        set_error(jq, top);
-        goto do_backtrack;
-      } else {
-        // C-coded function returns invalid w/o msg? -> backtrack, as if
-        // it had returned `empty`
+      if (!jv_is_valid(top)) {
+        if (jv_invalid_has_msg(jv_copy(top)))
+          set_error(jq, top);
+        else
+          jv_free(top);
         goto do_backtrack;
       }
+
+      stack_push(jq, top);
       break;
     }
 
@@ -971,12 +1020,19 @@ jv jq_format_error(jv msg) {
   // Invalid with msg; prefix with "jq: error: "
 
   if (jv_get_kind(msg) != JV_KIND_INVALID) {
-    if (jv_get_kind(msg) == JV_KIND_STRING)
-      return jv_string_fmt("jq: error: %s", jv_string_value(msg));
+    if (jv_get_kind(msg) == JV_KIND_STRING) {
+      jv r = jv_string_fmt("jq: error: %s", jv_string_value(msg));
+      jv_free(msg);
+      return r;
+    }
 
     msg = jv_dump_string(msg, JV_PRINT_INVALID);
-    if (jv_get_kind(msg) == JV_KIND_STRING)
-      return jv_string_fmt("jq: error: %s", jv_string_value(msg));
+    if (jv_get_kind(msg) == JV_KIND_STRING) {
+      jv r = jv_string_fmt("jq: error: %s", jv_string_value(msg));
+      jv_free(msg);
+      return r;
+    }
+    jv_free(msg);
     return jq_format_error(jv_null());  // ENOMEM
   }
 
@@ -1011,6 +1067,15 @@ jq_state *jq_init(void) {
   jq->halted = 0;
   jq->exit_code = jv_invalid();
   jq->error_message = jv_invalid();
+
+  jq->input_cb = NULL;
+  jq->input_cb_data = NULL;
+
+  jq->debug_cb = NULL;
+  jq->debug_cb_data = NULL;
+
+  jq->stderr_cb = NULL;
+  jq->stderr_cb_data = NULL;
 
   jq->err_cb = default_err_cb;
   jq->err_cb_data = stderr;
@@ -1155,7 +1220,7 @@ args2obj(jv args)
   jv kk = jv_string("name");
   jv vk = jv_string("value");
   jv_array_foreach(args, i, v)
-    r = jv_object_set(r, jv_object_get(jv_copy(v), kk), jv_object_get(v, vk));
+    r = jv_object_set(r, jv_object_get(jv_copy(v), jv_copy(kk)), jv_object_get(v, jv_copy(vk)));
   jv_free(args);
   jv_free(kk);
   jv_free(vk);
@@ -1176,9 +1241,10 @@ int jq_compile_args(jq_state *jq, const char* str, jv args) {
   int nerrors = load_program(jq, locations, &program);
   if (nerrors == 0) {
     nerrors = builtins_bind(jq, &program);
-    if (nerrors == 0) {
-      nerrors = block_compile(program, &jq->bc, locations, args = args2obj(args));
-    }
+    if (nerrors == 0)
+      nerrors = block_compile(program, &jq->bc, locations, args2obj(args));
+    else
+      jv_free(args);
   } else
     jv_free(args);
   if (nerrors)
@@ -1202,7 +1268,8 @@ jv jq_get_prog_origin(jq_state *jq) {
 }
 
 jv jq_get_lib_dirs(jq_state *jq) {
-  return jq_get_attr(jq, jv_string("JQ_LIBRARY_PATH"));
+  jv lib_dirs = jq_get_attr(jq, jv_string("JQ_LIBRARY_PATH"));
+  return jv_is_valid(lib_dirs) ? lib_dirs : jv_array();
 }
 
 void jq_set_attrs(jq_state *jq, jv attrs) {
@@ -1241,6 +1308,16 @@ void jq_set_debug_cb(jq_state *jq, jq_msg_cb cb, void *data) {
 void jq_get_debug_cb(jq_state *jq, jq_msg_cb *cb, void **data) {
   *cb = jq->debug_cb;
   *data = jq->debug_cb_data;
+}
+
+void jq_set_stderr_cb(jq_state *jq, jq_msg_cb cb, void *data) {
+  jq->stderr_cb = cb;
+  jq->stderr_cb_data = data;
+}
+
+void jq_get_stderr_cb(jq_state *jq, jq_msg_cb *cb, void **data) {
+  *cb = jq->stderr_cb;
+  *data = jq->stderr_cb_data;
 }
 
 void

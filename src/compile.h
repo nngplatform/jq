@@ -16,13 +16,13 @@ typedef struct block {
 
 block gen_location(location, struct locfile*, block);
 
-block gen_noop();
+block gen_noop(void);
 int block_is_noop(block b);
 block gen_op_simple(opcode op);
+block gen_error(jv constant);
 block gen_const(jv constant);
 block gen_const_global(jv constant, const char *name);
 int block_is_const(block b);
-int block_is_const_inf(block b);
 jv_kind block_const_kind(block b);
 jv block_const(block b);
 block gen_op_target(opcode op, block target);
@@ -33,7 +33,7 @@ block gen_op_pushk_under(jv constant);
 
 block gen_module(block metadata);
 jv block_module_meta(block b);
-block gen_import(const char* name, const char *as, int is_data);
+block gen_import(jv name, jv as, int is_data);
 block gen_import_meta(block import, block metadata);
 block gen_function(const char* name, block formals, block body);
 block gen_param_regular(const char* name);
@@ -59,7 +59,6 @@ block gen_destructure(block var, block matcher, block body);
 block gen_destructure_alt(block matcher);
 
 block gen_cond(block cond, block iftrue, block iffalse);
-block gen_try_handler(block handler);
 block gen_try(block exp, block handler);
 block gen_label(const char *label, block exp);
 

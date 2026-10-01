@@ -5,6 +5,17 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#if (defined(__GNUC__) && __GNUC__ >= 7) || \
+    (defined(__clang__) && __clang_major__ >= 10)
+# define JQ_FALLTHROUGH __attribute__((fallthrough))
+#else
+# define JQ_FALLTHROUGH do {} while (0) /* fallthrough */
+#endif
+
 typedef enum {
   JV_KIND_INVALID,
   JV_KIND_NULL,
@@ -32,17 +43,23 @@ typedef struct {
 } jv;
 
 /*
- * All jv_* functions consume (decref) input and produce (incref) output
- * Except jv_copy
+ * Unless noted otherwise, functions consume their jv arguments. Returned jv
+ * values are owned. Pass jv_copy(value) to retain a value across a consuming
+ * call, and release each owned value with jv_free() when no longer needed.
+ * Borrowed arguments are not consumed; the caller retains ownership.
+ * Returned jv values are owned even when the arguments are borrowed.
  */
 
+/* These functions borrow their jv arguments. */
 jv_kind jv_get_kind(jv);
 const char* jv_kind_name(jv_kind);
 static int jv_is_valid(jv x) { return jv_get_kind(x) != JV_KIND_INVALID; }
 
+/* Borrows its argument and returns a new reference to the same value. */
 jv jv_copy(jv);
 void jv_free(jv);
 
+/* Borrows its argument. */
 int jv_get_refcnt(jv);
 
 int jv_equal(jv, jv);
@@ -61,10 +78,15 @@ jv jv_bool(int);
 
 jv jv_number(double);
 jv jv_number_with_literal(const char*);
+/* These functions borrow their jv arguments. */
 double jv_number_value(jv);
 int jv_is_integer(jv);
+jv jv_number_abs(jv);
+jv jv_number_negate(jv);
 
-int jv_number_has_literal(jv n);
+/* Borrows its argument. */
+int jv_number_has_literal(jv);
+/* Borrows its argument; the returned string belongs to the number. */
 const char* jv_number_get_literal(jv);
 
 jv jv_array(void);
@@ -102,6 +124,9 @@ jv jv_array_indexes(jv, jv);
   __attribute__ ((__format__( __printf__, fmt_arg_num, args_num)))
 #define JV_VPRINTF_LIKE(fmt_arg_num) \
   __attribute__ ((__format__( __printf__, fmt_arg_num, 0)))
+#else
+#define JV_PRINTF_LIKE(fmt_arg_num, args_num)
+#define JV_VPRINTF_LIKE(fmt_arg_num)
 #endif
 
 
@@ -111,6 +136,7 @@ jv jv_string_empty(int len);
 int jv_string_length_bytes(jv);
 int jv_string_length_codepoints(jv);
 unsigned long jv_string_hash(jv);
+/* Borrows its argument; the returned string belongs to the value. */
 const char* jv_string_value(jv);
 jv jv_string_indexes(jv j, jv k);
 jv jv_string_slice(jv j, int start, int end);
@@ -120,6 +146,7 @@ jv jv_string_fmt(const char*, ...) JV_PRINTF_LIKE(1, 2);
 jv jv_string_append_codepoint(jv a, uint32_t c);
 jv jv_string_append_buf(jv a, const char* buf, int len);
 jv jv_string_append_str(jv a, const char* str);
+jv jv_string_repeat(jv j, int n);
 jv jv_string_split(jv j, jv sep);
 jv jv_string_explode(jv j);
 jv jv_string_implode(jv j);
@@ -133,6 +160,7 @@ int jv_object_length(jv object);
 jv jv_object_merge(jv, jv);
 jv jv_object_merge_recursive(jv, jv);
 
+/* Object iteration borrows the object; returned keys and values are owned. */
 int jv_object_iter(jv);
 int jv_object_iter_next(jv, int);
 int jv_object_iter_valid(jv, int);
@@ -196,6 +224,7 @@ jv jv_object_iter_value(jv, int);
 
 
 
+/* Borrows its argument. */
 int jv_get_refcnt(jv);
 
 enum jv_print_flags {
@@ -212,9 +241,10 @@ enum jv_print_flags {
   JV_PRINT_SPACE2   = 1024,
 };
 #define JV_PRINT_INDENT_FLAGS(n) \
-    ((n) < 0 || (n) > 7 ? JV_PRINT_TAB | JV_PRINT_PRETTY : (n) == 0 ? 0 : (n) << 8 | JV_PRINT_PRETTY)
+    ((n) < 0 || (n) > 7 ? JV_PRINT_TAB | JV_PRINT_PRETTY : (n) << 8 | JV_PRINT_PRETTY)
 void jv_dumpf(jv, FILE *f, int flags);
 void jv_dump(jv, int flags);
+/* Borrows its argument, unlike jv_dump() and jv_dumpf(). */
 void jv_show(jv, int flags);
 jv jv_dump_string(jv, int flags);
 char *jv_dump_string_trunc(jv x, char *outbuf, size_t bufsize);
@@ -227,6 +257,7 @@ enum {
 
 jv jv_parse(const char* string);
 jv jv_parse_sized(const char* string, int length);
+jv jv_parse_custom_flags(const char* string, int flags);
 
 typedef void (*jv_nomem_handler_f)(void *);
 void jv_nomem_handler(jv_nomem_handler_f, void *);
@@ -249,9 +280,13 @@ jv jv_delpaths(jv, jv);
 jv jv_keys(jv /*object or array*/);
 jv jv_keys_unsorted(jv /*object or array*/);
 int jv_cmp(jv, jv);
-jv jv_group(jv, jv);
 jv jv_sort(jv, jv);
+jv jv_group(jv, jv);
+jv jv_unique(jv, jv);
 
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 

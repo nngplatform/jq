@@ -1,8 +1,4 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE // for strdup
-#endif
 #include <assert.h>
-#include <math.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -10,7 +6,7 @@
 #include "bytecode.h"
 #include "locfile.h"
 #include "jv_alloc.h"
-#include "linker.h"
+#include "util.h"
 
 /*
   The intermediate representation for jq filters is as a sequence of
@@ -132,7 +128,7 @@ block gen_location(location loc, struct locfile* l, block b) {
   return b;
 }
 
-block gen_noop() {
+block gen_noop(void) {
   block b = {0,0};
   return b;
 }
@@ -146,6 +142,13 @@ block gen_op_simple(opcode op) {
   return inst_block(inst_new(op));
 }
 
+
+block gen_error(jv constant) {
+  assert(opcode_describe(ERRORK)->flags & OP_HAS_CONSTANT);
+  inst *i = inst_new(ERRORK);
+  i->imm.constant = constant;
+  return inst_block(i);
+}
 
 block gen_const(jv constant) {
   assert(opcode_describe(LOADK)->flags & OP_HAS_CONSTANT);
@@ -173,12 +176,6 @@ block gen_op_pushk_under(jv constant) {
 
 int block_is_const(block b) {
   return (block_is_single(b) && (b.first->op == LOADK || b.first->op == PUSHK_UNDER));
-}
-
-int block_is_const_inf(block b) {
-  return (block_is_single(b) && b.first->op == LOADK &&
-          jv_get_kind(b.first->imm.constant) == JV_KIND_NUMBER &&
-          isinf(jv_number_value(b.first->imm.constant)));
 }
 
 jv_kind block_const_kind(block b) {
@@ -374,7 +371,6 @@ static block block_bind(block binder, block body, int bindflags) {
 
 block block_bind_library(block binder, block body, int bindflags, const char *libname) {
   bindflags |= OP_HAS_BINDING;
-  int nrefs = 0;
   int matchlen = (libname == NULL) ? 0 : strlen(libname);
   char *matchname = jv_mem_alloc(matchlen+2+1);
   matchname[0] = '\0';
@@ -397,7 +393,7 @@ block block_bind_library(block binder, block body, int bindflags, const char *li
 
     // This mutation is ugly, even if we undo it
     curr->symbol = tname;
-    nrefs += block_bind_subblock(inst_block(curr), body, bindflags2, 0);
+    block_bind_subblock(inst_block(curr), body, bindflags2, 0);
     curr->symbol = cname;
     free(tname);
   }
@@ -514,6 +510,7 @@ jv block_list_funcs(block body, int omit_underscores) {
 }
 
 block gen_module(block metadata) {
+  assert(block_is_const(metadata) && block_const_kind(metadata) == JV_KIND_OBJECT);
   inst* i = inst_new(MODULEMETA);
   i->imm.constant = block_const(metadata);
   if (jv_get_kind(i->imm.constant) != JV_KIND_OBJECT)
@@ -528,13 +525,17 @@ jv block_module_meta(block b) {
   return jv_null();
 }
 
-block gen_import(const char* name, const char* as, int is_data) {
+block gen_import(jv name, jv as, int is_data) {
+  assert(jv_get_kind(name) == JV_KIND_STRING);
+  assert(!jv_is_valid(as) || jv_get_kind(as) == JV_KIND_STRING);
   inst* i = inst_new(DEPS);
   jv meta = jv_object();
-  if (as != NULL)
-    meta = jv_object_set(meta, jv_string("as"), jv_string(as));
+  if (jv_is_valid(as))
+    meta = jv_object_set(meta, jv_string("as"), as);
+  else
+    jv_free(as);
   meta = jv_object_set(meta, jv_string("is_data"), is_data ? jv_true() : jv_false());
-  meta = jv_object_set(meta, jv_string("relpath"), jv_string(name));
+  meta = jv_object_set(meta, jv_string("relpath"), name);
   i->imm.constant = meta;
   return inst_block(i);
 }
@@ -831,8 +832,7 @@ static block bind_alternation_matchers(block matchers, block body) {
 
 block gen_reduce(block source, block matcher, block init, block body) {
   block res_var = gen_op_var_fresh(STOREV, "reduce");
-  block loop = BLOCK(gen_op_simple(DUPN),
-                     source,
+  block loop = BLOCK(source,
                      bind_alternation_matchers(matcher,
                                   BLOCK(gen_op_bound(LOADVN, res_var),
                                         body,
@@ -841,52 +841,34 @@ block gen_reduce(block source, block matcher, block init, block body) {
   return BLOCK(gen_op_simple(DUP),
                init,
                res_var,
+               gen_op_simple(DUP),
                gen_op_target(FORK, loop),
                loop,
+               gen_op_simple(POP),
                gen_op_bound(LOADVN, res_var));
 }
 
 block gen_foreach(block source, block matcher, block init, block update, block extract) {
-  block output = gen_op_targetlater(JUMP);
   block state_var = gen_op_var_fresh(STOREV, "foreach");
-  block loop = BLOCK(gen_op_simple(DUPN),
-                     // get a value from the source expression:
-                     source,
-                     // destructure the value into variable(s) for all the code
-                     // in the body to see
-                     bind_alternation_matchers(matcher,
-                                  // load the loop state variable
-                                  BLOCK(gen_op_bound(LOADVN, state_var),
-                                        // generate updated state
-                                        update,
-                                        // save the updated state for value extraction
-                                        gen_op_simple(DUP),
-                                        // save new state
-                                        gen_op_bound(STOREV, state_var),
-                                        // extract an output...
-                                        extract,
-                                        // ...and output it by jumping
-                                        // past the BACKTRACK that comes
-                                        // right after the loop body,
-                                        // which in turn is there
-                                        // because...
-                                        //
-                                        // (Incidentally, extract can also
-                                        // backtrack, e.g., if it calls
-                                        // empty, in which case we don't
-                                        // get here.)
-                                        output)));
-  block foreach = BLOCK(gen_op_simple(DUP),
-                        init,
-                        state_var,
-                        gen_op_target(FORK, loop),
-                        loop,
-                        // ...at this point `foreach`'s original input
-                        // will be on top of the stack, and we don't
-                        // want to output it, so we backtrack.
-                        gen_op_simple(BACKTRACK));
-  inst_set_target(output, foreach); // make that JUMP go bast the BACKTRACK at the end of the loop
-  return foreach;
+  return BLOCK(gen_op_simple(DUP),
+               init,
+               state_var,
+               gen_op_simple(DUP),
+               // get a value from the source expression:
+               source,
+               // destructure the value into variable(s) for all the code
+               // in the body to see
+               bind_alternation_matchers(matcher,
+                            // load the loop state variable
+                            BLOCK(gen_op_bound(LOADVN, state_var),
+                                  // generate updated state
+                                  update,
+                                  // save the updated state for value extraction
+                                  gen_op_simple(DUP),
+                                  // save new state
+                                  gen_op_bound(STOREV, state_var),
+                                  // extract an output...
+                                  extract)));
 }
 
 block gen_definedor(block a, block b) {
@@ -1033,43 +1015,40 @@ block gen_cond(block cond, block iftrue, block iffalse) {
                               BLOCK(gen_op_simple(POP), iffalse)));
 }
 
-block gen_try_handler(block handler) {
-  // Quite a pain just to hide jq's internal errors.
-  return gen_cond(// `if type=="object" and .__jq
-                  gen_and(gen_call("_equal",
-                                   BLOCK(gen_lambda(gen_const(jv_string("object"))),
-                                         gen_lambda(gen_call("type", gen_noop())))),
-                          BLOCK(gen_subexp(gen_const(jv_string("__jq"))),
-                                gen_noop(),
-                                gen_op_simple(INDEX))),
-                  // `then error`
-                  gen_call("error", gen_noop()),
-                  // `else HANDLER end`
-                  handler);
-}
-
 block gen_try(block exp, block handler) {
   /*
-   * Produce something like:
-   *  FORK_OPT <address of handler>
+   * Produce:
+   *
+   *  TRY_BEGIN handler
    *  <exp>
-   *  JUMP <end of handler>
-   *  <handler>
+   *  TRY_END
+   *  JUMP past_handler
+   *  handler: <handler>
+   *  past_handler:
    *
-   * If this is not an internal try/catch, then catch and re-raise
-   * internal errors to prevent them from leaking.
+   * If <exp> backtracks then TRY_BEGIN will backtrack.
    *
-   * The handler will only execute if we backtrack to the FORK_OPT with
-   * an error (exception).  If <exp> produces no value then FORK_OPT
-   * will backtrack (propagate the `empty`, as it were.  If <exp>
-   * produces a value then we'll execute whatever bytecode follows this
-   * sequence.
+   * If <exp> produces a value then we'll execute whatever bytecode follows
+   * this sequence.  If that code raises an exception, then TRY_END will wrap
+   * and re-raise that exception, and TRY_BEGIN will unwrap and re-raise the
+   * exception (see jq_next()).
+   *
+   * If <exp> raises then the TRY_BEGIN will see a non-wrapped exception and
+   * will jump to the handler (note the TRY_END will not execute in this case),
+   * and if the handler produces any values, then we'll execute whatever
+   * bytecode follows this sequence.  Note that TRY_END will not execute in
+   * this case, so if the handler raises an exception, or code past the handler
+   * raises an exception, then that exception won't be wrapped and re-raised,
+   * and the TRY_BEGIN will not catch it because it does not stack_save() when
+   * it branches to the handler.
    */
-  if (!handler.first && !handler.last)
-    // A hack to deal with `.` as the handler; we could use a real NOOP here
-    handler = BLOCK(gen_op_simple(DUP), gen_op_simple(POP), handler);
-  exp = BLOCK(exp, gen_op_target(JUMP, handler));
-  return BLOCK(gen_op_target(FORK_OPT, exp), exp, handler);
+
+  if (block_is_noop(handler))
+    handler = BLOCK(gen_op_simple(DUP), gen_op_simple(POP));
+
+  block jump = gen_op_target(JUMP, handler);
+  return BLOCK(gen_op_target(TRY_BEGIN, jump), exp, gen_op_simple(TRY_END),
+               jump, handler);
 }
 
 block gen_label(const char *label, block exp) {
@@ -1267,6 +1246,13 @@ static int compile(struct bytecode* bc, block b, struct locfile* lf, jv args, jv
 
     if (curr->op == CLOSURE_CREATE) {
       assert(curr->bound_by == curr);
+      // Prevent subfunction index from overflowing into ARG_NEWCLOSURE flag
+      if (bc->nsubfunctions >= ARG_NEWCLOSURE) {
+        locfile_locate(lf, curr->source,
+            "too many function parameters or local function definitions (max %d)", ARG_NEWCLOSURE - 1);
+        errors++;
+        break;
+      }
       curr->imm.intval = bc->nsubfunctions++;
     }
     if (curr->op == CLOSURE_CREATE_C) {
@@ -1286,8 +1272,8 @@ static int compile(struct bytecode* bc, block b, struct locfile* lf, jv args, jv
   }
   bc->codelen = pos;
   bc->debuginfo = jv_object_set(bc->debuginfo, jv_string("locals"), localnames);
-  if (bc->nsubfunctions) {
-    bc->subfunctions = jv_mem_calloc(sizeof(struct bytecode*), bc->nsubfunctions);
+  if (bc->nsubfunctions && !errors) {
+    bc->subfunctions = jv_mem_calloc(bc->nsubfunctions, sizeof(struct bytecode*));
     for (inst* curr = b.first; curr; curr = curr->next) {
       if (curr->op == CLOSURE_CREATE) {
         struct bytecode* subfn = jv_mem_alloc(sizeof(struct bytecode));
@@ -1300,6 +1286,13 @@ static int compile(struct bytecode* bc, block b, struct locfile* lf, jv args, jv
         for (inst* param = curr->arglist.first; param; param = param->next) {
           assert(param->op == CLOSURE_PARAM);
           assert(param->bound_by == param);
+          // Prevent closure index from overflowing into ARG_NEWCLOSURE flag
+          if (subfn->nclosures >= ARG_NEWCLOSURE) {
+            locfile_locate(lf, curr->source,
+                "function has too many parameters (max %d)", ARG_NEWCLOSURE - 1);
+            errors++;
+            break;
+          }
           param->imm.intval = subfn->nclosures++;
           param->compiled = subfn;
           params = jv_array_append(params, jv_string(param->symbol));
@@ -1310,9 +1303,10 @@ static int compile(struct bytecode* bc, block b, struct locfile* lf, jv args, jv
       }
     }
   } else {
+    bc->nsubfunctions = 0;
     bc->subfunctions = 0;
   }
-  uint16_t* code = jv_mem_calloc(sizeof(uint16_t), bc->codelen);
+  uint16_t* code = jv_mem_calloc(bc->codelen, sizeof(uint16_t));
   bc->code = code;
   pos = 0;
   jv constant_pool = jv_array();
@@ -1347,6 +1341,7 @@ static int compile(struct bytecode* bc, block b, struct locfile* lf, jv args, jv
       code[pos++] = nesting_level(bc, curr->bound_by);
       uint16_t var = (uint16_t)curr->bound_by->imm.intval;
       code[pos++] = var;
+      if (var > maxvar) maxvar = var;
     } else if (op->flags & OP_HAS_CONSTANT) {
       code[pos++] = jv_array_length(jv_copy(constant_pool));
       constant_pool = jv_array_append(constant_pool, jv_copy(curr->imm.constant));
@@ -1377,7 +1372,7 @@ int block_compile(block b, struct bytecode** out, struct locfile* lf, jv args) {
   bc->globals = jv_mem_alloc(sizeof(struct symbol_table));
   int ncfunc = count_cfunctions(b);
   bc->globals->ncfunctions = 0;
-  bc->globals->cfunctions = jv_mem_calloc(sizeof(struct cfunction), ncfunc);
+  bc->globals->cfunctions = jv_mem_calloc(MAX(ncfunc, 1), sizeof(struct cfunction));
   bc->globals->cfunc_names = jv_array();
   bc->debuginfo = jv_object_set(jv_object(), jv_string("name"), jv_null());
   jv env = jv_invalid();

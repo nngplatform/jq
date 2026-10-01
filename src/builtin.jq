@@ -4,52 +4,53 @@ def map(f): [.[] | f];
 def select(f): if f then . else empty end;
 def sort_by(f): _sort_by_impl(map([f]));
 def group_by(f): _group_by_impl(map([f]));
-def unique: group_by(.) | map(.[0]);
-def unique_by(f): group_by(f) | map(.[0]);
+def unique_by(f): _unique_by_impl(map([f]));
 def max_by(f): _max_by_impl(map([f]));
 def min_by(f): _min_by_impl(map([f]));
-def add: reduce .[] as $x (null; . + $x);
+def add(f): reduce f as $x (null; . + $x);
+def add: add(.[]);
 def del(f): delpaths([path(f)]);
+def abs: if . < 0 then - . else . end;
 def _assign(paths; $value): reduce path(paths) as $p (.; setpath($p; $value));
 def _modify(paths; update):
-    reduce path(paths) as $p (.;
+    reduce path(paths) as $p ([., []];
         . as $dot
       | null
       | label $out
-      | ($dot | getpath($p)) as $v
+      | ($dot[0] | getpath($p)) as $v
       | (
           (   $$$$v
             | update
             | (., break $out) as $v
             | $$$$dot
-            | setpath($p; $v)
+            | setpath([0] + $p; $v)
           ),
           (
               $$$$dot
-            | delpaths([$p])
+            | setpath([1, (.[1] | length)]; $p)
           )
         )
-    );
+    ) | . as $dot | $dot[0] | delpaths($dot[1]);
 def map_values(f): .[] |= f;
 
 # recurse
 def recurse(f): def r: ., (f | r); r;
 def recurse(f; cond): def r: ., (f | select(cond) | r); r;
 def recurse: recurse(.[]?);
-def recurse_down: recurse;
 
 def to_entries: [keys_unsorted[] as $k | {key: $k, value: .[$k]}];
-def from_entries: map({(.key // .Key // .name // .Name): (if has("value") then .value else .Value end)}) | add | .//={};
+def from_entries: add(.[] | { (.key // .Key // .name // .Name):
+  if has("value") then .value else .Value end }) // {};
 def with_entries(f): to_entries | map(f) | from_entries;
-def reverse: [.[length - 1 - range(0;length)]];
+def reverse: [.[range(length-1;-1;-1)]];
 def indices($i): if type == "array" and ($i|type) == "array" then .[$i]
   elif type == "array" then .[[$i]]
   elif type == "string" and ($i|type) == "string" then _strindices($i)
   else .[$i] end;
 def index($i):   indices($i) | .[0];       # TODO: optimize
 def rindex($i):  indices($i) | .[-1:][0];  # TODO: optimize
-def paths: path(recurse(if (type|. == "array" or . == "object") then .[] else empty end))|select(length > 0);
-def paths(node_filter): . as $dot|paths|select(. as $p|$dot|getpath($p)|node_filter);
+def paths: path(recurse)|select(length > 0);
+def paths(node_filter): path(recurse|select(node_filter))|select(length > 0);
 def isfinite: type == "number" and (isinfinite | not);
 def arrays: select(type == "array");
 def objects: select(type == "object");
@@ -62,19 +63,24 @@ def strings: select(type == "string");
 def nulls: select(. == null);
 def values: select(. != null);
 def scalars: select(type|. != "array" and . != "object");
-def leaf_paths: paths(scalars);
+# Keep the accumulator the only reference on the left of + so the string is
+# appended in place; a nested + or a // inside the reduce copies it every step.
 def join($x): reduce .[] as $i (null;
-            (if .==null then "" else .+$x end) +
-            ($i | if type=="boolean" or type=="number" then tostring else .//"" end)
+            (if .==null then "" else .+$x end) |
+            . + ($i | if type=="boolean" or type=="number" then tostring end)
         ) // "";
 def _flatten($x): reduce .[] as $i ([]; if $i | type == "array" and $x != 0 then . + ($i | _flatten($x-1)) else . + [$i] end);
 def flatten($x): if $x < 0 then error("flatten depth must not be negative") else _flatten($x) end;
 def flatten: _flatten(-1);
+def range($x;$y): range($x;$y;1);
 def range($x): range(0;$x);
 def fromdateiso8601: strptime("%Y-%m-%dT%H:%M:%SZ")|mktime;
 def todateiso8601: strftime("%Y-%m-%dT%H:%M:%SZ");
 def fromdate: fromdateiso8601;
 def todate: todateiso8601;
+def ltrimstr($left): if startswith($left) then .[$left | length:] end;
+def rtrimstr($right): if endswith($right) then .[:length - ($right | length)] end;
+def trimstr($val): ltrimstr($val) | rtrimstr($val);
 def match(re; mode): _match_impl(re; mode; false)|.[];
 def match($val): ($val|type) as $vt | if $vt == "string" then match($val; null)
    elif $vt == "array" and ($val | length) > 1 then match($val[0]; $val[1])
@@ -90,68 +96,40 @@ def capture($val): ($val|type) as $vt | if $vt == "string" then capture($val; nu
    elif $vt == "array" and ($val | length) > 1 then capture($val[0]; $val[1])
    elif $vt == "array" and ($val | length) > 0 then capture($val[0]; null)
    else error( $vt + " not a string or array") end;
-def scan(re):
-  match(re; "g")
-  |  if (.captures|length > 0)
+def scan($re; $flags):
+  match($re; "g" + $flags)
+    | if (.captures|length > 0)
       then [ .captures | .[] | .string ]
       else .string
-      end ;
-#
-# If input is an array, then emit a stream of successive subarrays of length n (or less),
-# and similarly for strings.
-def _nwise(a; $n): if a|length <= $n then a else a[0:$n] , _nwise(a[$n:]; $n) end;
-def _nwise($n): _nwise(.; $n);
-#
+      end;
+def scan($re): scan($re; null);
+
 # splits/1 produces a stream; split/1 is retained for backward compatibility.
-def splits($re; flags): . as $s
-#  # multiple occurrences of "g" are acceptable
-  | [ match($re; "g" + flags) | (.offset, .offset + .length) ]
-  | [0] + . +[$s|length]
-  | _nwise(2)
-  | $s[.[0]:.[1] ] ;
+def splits($re; $flags):
+  .[foreach (match($re; $flags+"g"), null) as {$offset, $length}
+      (null; {start: .next, end: $offset, next: ($offset+$length)})];
 def splits($re): splits($re; null);
-#
+
 # split emits an array for backward compatibility
-def split($re; flags): [ splits($re; flags) ];
-#
-# If s contains capture variables, then create a capture object and pipe it to s
-def sub($re; s):
-  . as $in
-  | [match($re)]
-  | if length == 0 then $in
-    else .[0]
-    | . as $r
-#  # create the "capture" object:
-    | reduce ( $r | .captures | .[] | select(.name != null) | { (.name) : .string } ) as $pair
-        ({}; . + $pair)
-    | $in[0:$r.offset] + s + $in[$r.offset+$r.length:]
-    end ;
-#
-# If s contains capture variables, then create a capture object and pipe it to s
-def sub($re; s; flags):
-  def subg: [explode[] | select(. != 103)] | implode;
-  # "fla" should be flags with all occurrences of g removed; gs should be non-nil if flags has a g
-  def sub1(fla; gs):
-    def mysub:
-      . as $in
-      | [match($re; fla)]
-      | if length == 0 then $in
-        else .[0] as $edit
-        | ($edit | .offset + .length) as $len
-        # create the "capture" object:
-        | reduce ( $edit | .captures | .[] | select(.name != null) | { (.name) : .string } ) as $pair
-            ({}; . + $pair)
-        | $in[0:$edit.offset]
-          + s
-          + ($in[$len:] | if length > 0 and gs then mysub else . end)
-        end ;
-    mysub ;
-    (flags | index("g")) as $gs
-    | (flags | if $gs then subg else . end) as $fla
-    | sub1($fla; $gs);
-#
+def split($re; $flags): [ splits($re; $flags) ];
+
+# If s contains capture variables, then create a capture object and pipe it to s, bearing
+# in mind that s could be a stream
+def sub($re; s; $flags):
+   . as $in
+   | (reduce match($re; $flags) as $edit
+        ({result: [], previous: 0};
+            $in[ .previous: ($edit | .offset) ] as $gap
+            # create the "capture" objects (one per item in s)
+            | [reduce ( $edit | .captures | .[] | select(.name != null) | { (.name) : .string } ) as $pair
+                 ({}; . + $pair) | s ] as $inserts
+            | reduce range(0; $inserts|length) as $ix (.; .result[$ix] += $gap + $inserts[$ix])
+            | .previous = ($edit | .offset + .length ) )
+          | .result[] + $in[.previous:] )
+      // $in;
+
 def sub($re; s): sub($re; s; "");
-# repeated substitution of re (which may contain named captures)
+
 def gsub($re; s; flags): sub($re; s; flags + "g");
 def gsub($re; s): sub($re; s; "g");
 
@@ -165,15 +143,14 @@ def until(cond; next):
      def _until:
          if cond then . else (next|_until) end;
      _until;
-def limit($n; exp):
-    if $n > 0 then label $out | foreach exp as $item ($n; .-1; $item, if . <= 0 then break $out else empty end)
-    elif $n == 0 then empty
-    else exp end;
-# range/3, with a `by` expression argument
-def range($init; $upto; $by):
-    if $by > 0 then $init|while(. < $upto; . + $by)
-  elif $by < 0 then $init|while(. > $upto; . + $by)
-  else empty end;
+def limit($n; expr):
+  if $n > 0 then label $out | foreach expr as $item ($n; . - 1; $item, if . <= 0 then break $out else empty end)
+  elif $n == 0 then empty
+  else error("limit doesn't support negative count") end;
+def skip($n; expr):
+  if $n > 0 then foreach expr as $item ($n; . - 1; if . < 0 then $item else empty end)
+  elif $n == 0 then expr
+  else error("skip doesn't support negative count") end;
 def first(g): label $out | g | ., break $out;
 def isempty(g): first((g|false), true);
 def all(generator; condition): isempty(generator|condition and empty);
@@ -182,8 +159,9 @@ def all(condition): all(.[]; condition);
 def any(condition): any(.[]; condition);
 def all: all(.[]; .);
 def any: any(.[]; .);
-def last(g): reduce g as $item (null; $item);
-def nth($n; g): if $n < 0 then error("nth doesn't support negative indices") else last(limit($n + 1; g)) end;
+def nth($n; g):
+  if $n < 0 then error("nth doesn't support negative indices")
+  else first(skip($n; g)) end;
 def first: .[0];
 def last: .[-1];
 def nth($n): .[$n];
@@ -199,14 +177,7 @@ def combinations(n):
       | combinations;
 # transpose a possibly jagged matrix, quickly;
 # rows are padded with nulls so the result is always rectangular.
-def transpose:
-  if . == [] then []
-  else . as $in
-  | (map(length) | max) as $max
-  | length as $length
-  | reduce range(0; $max) as $j
-      ([]; . + [reduce range(0;$length) as $i ([]; . + [ $in[$i][$j] ] )] )
-	        end;
+def transpose: [range(0; map(length)|max // 0) as $i | [.[][$i]]];
 def in(xs): . as $x | xs | has($x);
 def inside(xs): . as $x | xs | contains($x);
 def repeat(exp):
@@ -237,47 +208,25 @@ def tostream:
   getpath($p) |
   reduce path(.[]?) as $q ([$p, .]; [$p+$q]);
 
-
-# Assuming the input array is sorted, bsearch/1 returns
-# the index of the target if the target is in the input array; and otherwise
-#  (-1 - ix), where ix is the insertion point that would leave the array sorted.
-# If the input is not sorted, bsearch will terminate but with irrelevant results.
-def bsearch($target):
-  if length == 0 then -1
-  elif length == 1 then
-     if $target == .[0] then 0 elif $target < .[0] then -1 else -2 end
-  else . as $in
-    # state variable: [start, end, answer]
-    # where start and end are the upper and lower offsets to use.
-    | [0, length-1, null]
-    | until( .[0] > .[1] ;
-             if .[2] != null then (.[1] = -1)               # i.e. break
-             else
-               ( ( (.[1] + .[0]) / 2 ) | floor ) as $mid
-               | $in[$mid] as $monkey
-               | if $monkey == $target  then (.[2] = $mid)   # success
-                 elif .[0] == .[1]     then (.[1] = -1)     # failure
-                 elif $monkey < $target then (.[0] = ($mid + 1))
-                 else (.[1] = ($mid - 1))
-                 end
-             end )
-    | if .[2] == null then          # compute the insertion point
-         if $in[ .[0] ] < $target then (-2 -.[0])
-         else (-1 -.[0])
-         end
-      else .[2]
-      end
-  end;
-
 # Apply f to composite entities recursively, and to atoms
 def walk(f):
+  def w:
+    if type == "object"
+    then map_values(w)
+    elif type == "array" then map(w)
+    else .
+    end
+    | f;
+  w;
+
+# pathexps could be a stream of dot-paths
+def pick(pathexps):
   . as $in
-  | if type == "object" then
-      reduce keys_unsorted[] as $key
-        ( {}; . + { ($key):  ($in[$key] | walk(f)) } ) | f
-  elif type == "array" then map( walk(f) ) | f
-  else f
-  end;
+  | reduce path(pathexps) as $a (null;
+      setpath($a; $in|getpath($a)) );
+
+# ensure the output of debug(m1,m2) is kept together:
+def debug(msgs): (msgs | debug | empty), .;
 
 # SQL-ish operators here:
 def INDEX(stream; idx_expr):
